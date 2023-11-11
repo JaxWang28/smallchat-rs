@@ -12,11 +12,14 @@ use tokio::{
 };
 use std::sync::Arc;
 
+/* 用来存储一个 client 的信息 */
 struct Client {
     nick: String,
     id: u32,
 }
 
+
+/* main 通过 #[tokio::main] 创建 tokio runtime */
 #[tokio::main]
 async fn main() {
     let listener = TcpListener::bind("127.0.0.1:7878").await.unwrap();
@@ -29,6 +32,7 @@ async fn main() {
     }
 }
 
+/* 处理 TcpStream, 将其分离为接收端和发送端，分别分配到 receive_task 和 send_task 中 */
 async fn process_client(mut client_stream: TcpStream, tx: Sender<(u32, String)>, id: u32){
     let str = "Welcome to Simple Chat! Use /nick <nick> to set your nick.\n";
     if let Err(e) = client_stream.write_all(str.as_bytes()).await {
@@ -36,6 +40,7 @@ async fn process_client(mut client_stream: TcpStream, tx: Sender<(u32, String)>,
         return;
     }
 
+    /* 用来在 receive_task 和 send_task 中共享数据 */
     let client = Arc::new(Mutex::new(Client{
         nick:format!("User {}", id),
         id,
@@ -44,10 +49,12 @@ async fn process_client(mut client_stream: TcpStream, tx: Sender<(u32, String)>,
     let (client_reader, client_writer) = client_stream.into_split();
     let rx = tx.subscribe();
 
+    /* 创建 receive_task */
     let mut receive_task = tokio::spawn(receive_from_client(client_reader, tx, client));
+    /* 创建 send_task */
     let mut send_task = tokio::spawn(send_to_client(client_writer, rx, client_clone));
 
-    // 无论是读任务还是写任务的终止，另一个任务都将没有继续存在的意义，因此都将另一个任务也终止
+    /* 无论哪一个 task 终止，另一个都没有存在的意义 */
     if tokio::try_join!(&mut receive_task, &mut send_task).is_err() {
         eprintln!("read_task/write_task terminated");
         receive_task.abort();
@@ -55,6 +62,7 @@ async fn process_client(mut client_stream: TcpStream, tx: Sender<(u32, String)>,
     };
 }
 
+/* 从 Tcp stream 中读取数据，将数据写入 Broadcast Channel */
 async fn receive_from_client(reader: OwnedReadHalf, tx: Sender<(u32,String)>, client: Arc::<Mutex::<Client>>){
     let mut buf_reader = tokio::io::BufReader::new(reader);
     let mut buf = String::new();
@@ -70,21 +78,22 @@ async fn receive_from_client(reader: OwnedReadHalf, tx: Sender<(u32,String)>, cl
                 break;
             }
             Ok(_n) => {
-                // read_line()读取时会包含换行符，因此去除行尾换行符
-                // 将buf.drain(。。)会将buf清空，下一次read_line读取的内容将从头填充而不是追加
+                /* 去除行尾换行符 */
                 buf.pop();
+                /* 将 buf 清空，确保下次从头填充而不是追加 */
                 let content = buf.drain(..).as_str().to_string();
 
+                /* 匹配从 Tcp Stream 中传入的是否为 /nick 命令 */
                 let prefix = "/nick ";
                 let mut client = client.lock().await;
                 match content.strip_prefix(prefix) {
+                    /* /nick 命令 */
                     Some(rest) => {
                         client.nick = rest.to_string();
                         client.nick.pop();
                     },
                     None => {
-                        // 将内容发送给writer，让writer响应给客户端，
-                        // 如果无法发送给writer，继续从客户端读取内容将没有意义，因此break退出
+                        /* 发送到 Broadcast Channel */
                         let content = format!("{} > {}", client.nick, content);
                         println!("{}", content);
                         if tx.send((client.id,content)).is_err() {
@@ -98,9 +107,11 @@ async fn receive_from_client(reader: OwnedReadHalf, tx: Sender<(u32,String)>, cl
     }
 }
 
+/* 从 Broadcast Channel 中读取数据，将数据写入 TcpStream */
 async fn send_to_client(mut writer: OwnedWriteHalf, mut rx: Receiver<(u32, String)>, client: Arc::<Mutex::<Client>>){
     while let Ok((id, mut str)) = rx.recv().await {
         let client = client.lock().await;
+        /* 过滤自己发送到 Broadcast 中的数据 */
         if id == client.id {
             continue;
         }
